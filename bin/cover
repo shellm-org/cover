@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+
+## \brief Get coverage for shell scripts.
+## \usage cover <PATTERN> <SCRIPT> [ARGS]
+pattern="$1"
+shift
+
+export SHELLOPTS
+export BASH_XTRACEFD
+
+OLD_PS4=${PS4}
+M=$'\035'
+export PS4="$M \${BASH_SOURCE}$M\${LINENO}$M"
+
+data_file="$(mktemp /tmp/cover.XXXXXX)"
+
+# shellcheck disable=SC2046
+root() { [ $(id -u) = 0 ]; }
+
+if root; then
+  env_file="$(mktemp)"
+  echo "export PS4='${PS4}'" > "${env_file}"
+  export BASH_ENV="${env_file}"
+fi
+
+BASH_XTRACEFD=4 bash -x "$@" 4>"${data_file}"
+
+if root; then
+  unset BASH_ENV
+  rm "${env_file}"
+fi
+
+PS4=${OLD_PS4}
+
+sed -r '/^[^'$M']/d;s/^'$M'+ //;s/'$M'[^'$M']*$//;s/'$M'/:/' "${data_file}" | sort -u > "${data_file}.ok"
+
+# shellcheck disable=SC1091
+source realpaths
+declare -A cache
+while IFS=: read -r source lineno; do
+  if [ -n "${source}" ]; then
+    if [ -z "${cache[${source}]}" ]; then
+      realpath.canonical "${source}"
+      if [ -f "${REPLY}" ]; then
+        cache[${source}]=${REPLY}
+      else
+        cache[${source}]=${source}
+      fi
+    fi
+    source=${cache[${source}]}
+  fi
+  echo "${source}:${lineno}"
+done < "${data_file}.ok" | grep "${pattern}" | grep -v '/tests/' | sort -u > "${data_file}.canon"
+
+readarray -t sources <<<"$(awk -F: '{print $1}' "${data_file}.canon" | sort -u)"
+
+echo
+echo "--- Coverage report ---"
+printf "%-40s %3s %3s %3s %3s %6s Missed lines\n" File T R C M P
+
+declare -a percent_covered
+declare -i total_relevant=0
+declare -i total_covered=0
+declare -i total_lines
+for src in "${sources[@]}"; do
+  unset lines
+  declare -a lines
+  declare -i relevant_lines=0
+  readarray -t non_exec_lines <<<"$(
+    grep -En \
+      -e '^[[:space:]]*$' \
+      -e '^[[:space:]]*;;[[:space:]]*$' \
+      -e '^[[:space:]]*#' \
+      -e '^[[:space:]]*[(){}]$' \
+      -e '^[[:space:]]*(then|else|fi|do|done|esac)[[:space:]]*$' \
+      -e '^[[:space:]]*function[[:space:]]+[\w:.-]+(\(\))?)' \
+      -e '^[[:space:]]*\(?[[:alnum:]_:.?*|"'\''-]+\)[[:space:]]*$' \
+      -e '^[[:space:]]*[[:alnum:]_:.-]+[[:space:]]*\(\)' "${src}" |
+    cut -d: -f1
+  )"
+  total_lines=$(wc -l <"${src}")
+  readarray -t covered_lines <<<"$(grep -E "${src}:[0-9]+\$" "${data_file}.canon" | cut -d: -f2)"
+  for nel in "${non_exec_lines[@]}"; do
+    lines[${nel}]=2
+  done
+  for cl in "${covered_lines[@]}"; do
+    lines[${cl}]=1
+  done
+  declare -a missed_lines
+  # shellcheck disable=SC2086
+  for i in $(seq 1 ${total_lines}); do
+    [ -z "${lines[$i]}" ] && missed_lines+=("$i")
+  done
+  relevant_lines=$(( total_lines - ${#non_exec_lines[@]}))
+  total_relevant+=${relevant_lines}
+  total_covered+=${#covered_lines[@]}
+  percent="$(echo "${#covered_lines[@]} / ${relevant_lines} * 100" | bc -l)"
+  case ${percent} in
+    0.0*) percent=0 ;;
+    *) percent=${percent:0:5} ;;
+  esac
+  percent_covered+=("${percent}")
+
+  printf "%-40s " "${pattern#/}${src#*${pattern}}"
+  printf "%3d %3d " "${total_lines}" "${relevant_lines}"
+  # shellcheck disable=SC2046,2005
+  printf "%3d %3d %5s%% %s" "${#covered_lines[@]}" "${#missed_lines[@]}" "${percent}" "$(echo $(printf "%s\n" "${missed_lines[@]}" | sort -g))"
+  echo
+done
+
+total_percent=$(echo "${total_covered}/${total_relevant}*100" | bc -l)
+case ${total_percent} in
+  0.0*) total_percent=0 ;;
+  *) total_percent=${total_percent:0:5} ;;
+esac
+echo "--- Total: (${total_percent}%) ---"
