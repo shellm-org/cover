@@ -12,7 +12,7 @@ OLD_PS4=${PS4}
 M=$'\035'
 export PS4="$M \${BASH_SOURCE}$M\${LINENO}$M"
 
-data_file="$(mktemp /tmp/cover.XXXXXX)"
+data_file="$(mktemp)"
 
 # shellcheck disable=SC2046
 root() { [ $(id -u) = 0 ]; }
