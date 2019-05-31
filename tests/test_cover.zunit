@@ -1,0 +1,12 @@
+#!/usr/bin/env zunit
+
+@test 'cover prints help with -h option' {
+  run cover -h
+  assert $state equals 0
+}
+
+@test 'cover correctly uses COVER_MARKER' {
+  COVER_MARKER=$'\036' run cover --shell zsh "tests/fixtures/script"
+  assert $state equals 0
+  assert "${lines[-1]}" contains "Total: 87.50%"
+}

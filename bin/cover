@@ -1,116 +1,282 @@
-#!/usr/bin/env bash
+#!/usr/bin/env zsh
 
 ## \brief Get coverage for shell scripts.
-## \usage cover <PATTERN> <SCRIPT> [ARGS]
-pattern="$1"
-shift
+## \usage cover <SCRIPT> [ARGS]
 
-export SHELLOPTS
-export BASH_XTRACEFD
+case $1 in
+  -h|--help)
+    echo "usage: cover <SCRIPT> [ARGS]"
+    exit 0
+  ;;
+  -s|--shell)
+    shell=$2
+    shift 2
+  ;;
+esac
 
-OLD_PS4=${PS4}
-M=$'\035'
-export PS4="$M \${BASH_SOURCE}$M\${LINENO}$M"
+prepare_data() {
+  # shellcheck disable=SC1091
+  typeset -A cache
+  local canon i=1
+  sed -ru "/^[^$M]/d;s/^$M+ //;s/${M}[^$M]*\$//;s/$M/:/;/^\$/d" "${data_file}" |
+    sort -u |
+      while IFS=: read -r source lineno; do
+        if [ -n "${source}" ]; then
+          if [ -z "${cache[${source}]}" ]; then
+            canon="$(realpath -e "${source}")"
+            if [ -f "${canon}" ]; then
+              cache[${source}]=${canon}
+            else
+              cache[${source}]=${source}
+            fi
+          fi
+          source=${cache[${source}]}
+          echo "${source}:${lineno}"
+        fi
+        let i++
+      done | grep -ve '/zshenv' -e '/usr/share/zsh' -e 'zunit' -e 'basher' -e '/tmp/bats\.' |
+        sort -u > "${data_file}.canon"
+}
+
+get_percentage() {
+  awk '{printf("%.2f",$1/$2*100); exit(0)}' <<<"$1 $2" | cut -c-5
+}
+
+print_source_result() {
+  printf " %${longest_source}s  %3s  %3s  %3s  %3s  %6s  %s\n" "$@"
+}
+
+apply_range_coverage() {
+  local line
+  local range
+  local covered
+  for range in "$@"; do
+    covered=0
+    for line in ${(z)range}; do
+      if [ "${lines_data[${line}]}" = "C" ]; then
+        covered=1
+        break
+      fi
+    done
+    if [ $covered -eq 1 ]; then
+      for line in ${(z)range}; do
+        if [ -z "${lines_data[${line}]}" ]; then
+          lines_data[${line}]=C
+          covered_lines+=("${line}")
+        fi
+      done
+    fi
+  done
+}
+
+finish_line() {
+  local text="$1"
+  local length="${#text}"
+  echo -n "${text}"
+  printf "─%.0s" {1..$(( COLUMNS - length ))}
+  echo
+}
+
+process_data() {
+  declare -i total_relevant_lines=0
+  declare -i total_covered_lines=0
+  declare -i total_missed_lines=0
+  declare -i total_lines=0
+
+  declare -i n_relevant_lines=0
+  declare -i n_covered_lines=0
+  declare -i n_missed_lines=0
+  declare -i n_lines=0
+
+  declare -i source_length=0
+  declare -i longest_source=0
+  declare -i line
+  declare -i previous_line
+
+  declare -a sources=()
+  declare -a lines_data=()
+  declare -a skipped_lines=()
+  declare -a missed_lines=()
+  declare -a covered_lines=()
+  declare -a range=()
+  declare -a ranges=()
+  declare -a ranges_ends=()
+  declare -a ranges_begins=()
+
+  declare percent_covered
+  declare total_percent_covered
+  declare readable_missed_lines
+  declare src
+  declare covered
+
+  declare pwd
+
+  pwd="$(realpath -e "$PWD")"
+
+  # Read unique set of source files from data to an array
+  IFS=$'\n' sources=($(awk -F: '{print $1}' "${data_file}.canon" | sort -u))
+
+  # Get the length of the longest source path, for display purposes
+  for src in "${sources[@]}"; do
+    src=${src#$pwd/}
+    source_length=${#src}
+    if (( source_length > longest_source )); then
+      longest_source=${source_length}
+    fi
+  done
+
+  echo
+  finish_line "┌── Coverage report "
+  echo " T=Total; R=Relevant; C=Covered; M=Missed; P=Percentage covered"
+  echo
+  print_source_result File T R C M P "Missed lines"
+
+  # For each unique source, compute:
+  #  number of lines
+  #  number of relevant lines
+  #  number of skipped (irrelevant) lines
+  #  number of covered lines
+  #  number of missed lines
+  # Also increment the "total" values
+  for src in "${sources[@]}"; do
+    if [ ! -f "${src}" ]; then
+      echo "error: $src"
+      continue
+    fi
+
+    n_lines=$(wc -l <"${src}")
+    total_lines+=${n_lines}
+    missed_lines=()
+    lines_data=()
+
+    # Get covered_lines from data file into an array
+    # (working thanks to shopt -s lastpipe, see man bash)
+    IFS=$'\n' covered_lines=($(
+      grep -E "${src}:[0-9]+\$" "${data_file}.canon" |
+      cut -d: -f2
+    ))
+
+    # Get skipped_lines from source file into an array
+    # (working thanks to shopt -s lastpipe, see man bash)
+    IFS=$'\n' skipped_lines=($(
+      grep -En \
+        -e '^[[:space:]]*$' \
+        -e '^[[:space:]]*;;[[:space:]]*$' \
+        -e '^[[:space:]]*#' \
+        -e '^[[:space:]]*[)}];?[[:space:]]*(#.*)?$' \
+        -e '^[[:space:]]*[({][[:space:]]*(#.*)?$' \
+        -e '^[[:space:]]*\)"?;?[[:space:]]*(#.*)?$' \
+        -e '^[[:space:]]*(then|else|fi|do|done|esac)[[:space:]]*;?[[:space:]]*([)}][[:space:]]*)?$' \
+        -e '^[[:space:]]*function[[:space:]]+[[:alnum:]_:.-]+[[:space:]]*(\(\))?[[:space:]]*\{[[:space:]]*(#.*)?$' \
+        -e '^[[:space:]]*[[:alnum:]_:.-]+[[:space:]]*\(\)[[:space:]]*\{[[:space:]]*(#.*)?$' \
+        -e '^[[:space:]]*\(?[[:alnum:]_:\.?*|"'\''-]+\)[[:space:]]*$' "${src}" |
+      cut -d: -f1
+    ))
+
+    # Fill up lines_data array
+    for line in "${skipped_lines[@]}"; do
+      lines_data[${line}]=S
+    done
+    for line in "${covered_lines[@]}"; do
+      lines_data[${line}]=C
+    done
+
+    # Hack to fix coverage for multi-line, non-string commands
+    IFS=$'\n' ranges_backslash=($(
+      echo $(grep -n '\\$' -A 1 "${src}" |
+        sed -r 's/^([0-9]+)-/\1:/' |
+          cut -d: -f1) | sed 's/ -- /\n/g'
+    ))
+
+    # echo $(grep -En '^[[:space:]]*\)[[:space:]]*[^#]+' -B 1 "${src}" |
+    #   sed -r 's/^([0-9]+)-/\1:/' |
+    #     cut -d: -f1) | sed 's/ -- /-/g' | IFS=- read -ra ranges_begins
+
+    apply_range_coverage "${ranges_backslash[@]}"
+    # apply_range_coverage ranges_begins
+    # apply_range_coverage ranges_ends
+
+    # Fill missed lines array thanks to lines_data array values
+    # shellcheck disable=SC2086
+    for i in $(seq 1 ${n_lines}); do
+      if [ -z "${lines_data[$i]}" ]; then
+        missed_lines+=("$i")
+      fi
+    done
+
+    n_relevant_lines=$(( n_lines - $#skipped_lines))
+    n_covered_lines=$#covered_lines
+    n_missed_lines=$#missed_lines
+
+    total_relevant_lines+=${n_relevant_lines}
+    total_covered_lines+=${n_covered_lines}
+    total_missed_lines+=${n_missed_lines}
+
+    percent_covered="$(get_percentage "${n_covered_lines}" "${n_relevant_lines}")"
+
+    readable_missed_lines=""
+    previous_line=$(( missed_lines[1] - 1 ))
+    for line in $(printf "%s\n" "${missed_lines[@]}" | sort -g); do
+      if (( line != previous_line + 1 )); then
+        case ${#range[@]} in
+          1) readable_missed_lines+="${range[1]}, " ;;
+          *) readable_missed_lines+="${range[1]}-${range[-1]}, " ;;
+        esac
+        range=()
+      fi
+      range+=(${line})
+      previous_line=${line}
+    done
+    case ${#range[@]} in
+      1) readable_missed_lines+="${range[1]}" ;;
+      *) readable_missed_lines+="${range[1]}-${range[-1]}" ;;
+    esac
+
+    # shellcheck disable=SC2046,2005
+    print_source_result \
+      "${src#$pwd/}" \
+      "${n_lines}" \
+      "${n_relevant_lines}" \
+      "${n_covered_lines}" \
+      "${n_missed_lines}" \
+      "${percent_covered}%" \
+      "${readable_missed_lines}"
+  done
+
+  echo
+  total_percent_covered="$(get_percentage "${total_covered_lines}" "${total_relevant_lines}")"
+  finish_line "└── Total: ${total_percent_covered}% "
+}
 
 data_file="$(mktemp)"
 
-# shellcheck disable=SC2046
-root() { [ $(id -u) = 0 ]; }
+M=${COVER_MARKER:-$'\035'}
+OLD_PS4=${PS4}
 
-if root; then
+if [ "${shell}" = "bash" ]; then
+
   env_file="$(mktemp)"
-  echo "export PS4='${PS4}'" > "${env_file}"
+  echo "set -x" > "${env_file}"
   export BASH_ENV="${env_file}"
-fi
-
-BASH_XTRACEFD=4 bash -x "$@" 4>"${data_file}"
-
-if root; then
+  export BASH_XTRACEFD
+  export PS4="$M \${BASH_SOURCE}$M\${LINENO}$M"
+  BASH_XTRACEFD=4 bash "$@" 4>"${data_file}"
   unset BASH_ENV
   rm "${env_file}"
+
+elif [ "${shell}" = "zsh" ]; then
+
+  env_dir="$(mktemp -d)"
+  echo "set -x" > "${env_dir}/.zshenv"
+  export ZDOTDIR="${env_dir}"
+  export PS4="$M %x$M%I$M"$'\n'
+  zsh "$@" 2>"${data_file}"
+  unset ZDOTDIR
+  rm -rf "${env_dir}"
+
 fi
 
 PS4=${OLD_PS4}
 
-sed -r '/^[^'$M']/d;s/^'$M'+ //;s/'$M'[^'$M']*$//;s/'$M'/:/' "${data_file}" | sort -u > "${data_file}.ok"
-
-# shellcheck disable=SC1091
-source realpaths
-declare -A cache
-while IFS=: read -r source lineno; do
-  if [ -n "${source}" ]; then
-    if [ -z "${cache[${source}]}" ]; then
-      realpath.canonical "${source}"
-      if [ -f "${REPLY}" ]; then
-        cache[${source}]=${REPLY}
-      else
-        cache[${source}]=${source}
-      fi
-    fi
-    source=${cache[${source}]}
-  fi
-  echo "${source}:${lineno}"
-done < "${data_file}.ok" | grep "${pattern}" | grep -v '/tests/' | sort -u > "${data_file}.canon"
-
-readarray -t sources <<<"$(awk -F: '{print $1}' "${data_file}.canon" | sort -u)"
-
-echo
-echo "--- Coverage report ---"
-printf "%-40s %3s %3s %3s %3s %6s Missed lines\n" File T R C M P
-
-declare -a percent_covered
-declare -i total_relevant=0
-declare -i total_covered=0
-declare -i total_lines
-for src in "${sources[@]}"; do
-  unset lines
-  declare -a lines
-  declare -i relevant_lines=0
-  readarray -t non_exec_lines <<<"$(
-    grep -En \
-      -e '^[[:space:]]*$' \
-      -e '^[[:space:]]*;;[[:space:]]*$' \
-      -e '^[[:space:]]*#' \
-      -e '^[[:space:]]*[(){}]$' \
-      -e '^[[:space:]]*(then|else|fi|do|done|esac)[[:space:]]*$' \
-      -e '^[[:space:]]*function[[:space:]]+[\w:.-]+(\(\))?)' \
-      -e '^[[:space:]]*\(?[[:alnum:]_:.?*|"'\''-]+\)[[:space:]]*$' \
-      -e '^[[:space:]]*[[:alnum:]_:.-]+[[:space:]]*\(\)' "${src}" |
-    cut -d: -f1
-  )"
-  total_lines=$(wc -l <"${src}")
-  readarray -t covered_lines <<<"$(grep -E "${src}:[0-9]+\$" "${data_file}.canon" | cut -d: -f2)"
-  for nel in "${non_exec_lines[@]}"; do
-    lines[${nel}]=2
-  done
-  for cl in "${covered_lines[@]}"; do
-    lines[${cl}]=1
-  done
-  declare -a missed_lines
-  # shellcheck disable=SC2086
-  for i in $(seq 1 ${total_lines}); do
-    [ -z "${lines[$i]}" ] && missed_lines+=("$i")
-  done
-  relevant_lines=$(( total_lines - ${#non_exec_lines[@]}))
-  total_relevant+=${relevant_lines}
-  total_covered+=${#covered_lines[@]}
-  percent="$(echo "${#covered_lines[@]} / ${relevant_lines} * 100" | bc -l)"
-  case ${percent} in
-    0.0*) percent=0 ;;
-    *) percent=${percent:0:5} ;;
-  esac
-  percent_covered+=("${percent}")
-
-  printf "%-40s " "${pattern#/}${src#*${pattern}}"
-  printf "%3d %3d " "${total_lines}" "${relevant_lines}"
-  # shellcheck disable=SC2046,2005
-  printf "%3d %3d %5s%% %s" "${#covered_lines[@]}" "${#missed_lines[@]}" "${percent}" "$(echo $(printf "%s\n" "${missed_lines[@]}" | sort -g))"
-  echo
-done
-
-total_percent=$(echo "${total_covered}/${total_relevant}*100" | bc -l)
-case ${total_percent} in
-  0.0*) total_percent=0 ;;
-  *) total_percent=${total_percent:0:5} ;;
-esac
-echo "--- Total: (${total_percent}%) ---"
+prepare_data
+process_data

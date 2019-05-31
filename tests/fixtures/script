@@ -1,0 +1,11 @@
+echo $(
+  # comment
+  echo "hello" \
+    "world
+    thanks" | # comment
+      cat | ( # comment
+        # comment
+        cat -n # comment
+      ) | cat && # comment
+      echo bye
+)
