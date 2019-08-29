@@ -1,3 +1,6 @@
+# The comment above each instruction
+# shows what the xtrace output for this commmand is.
+
 #
 # Single line commands, for reference.
 #
@@ -17,22 +20,22 @@ echo -E $'\n'
 # Multi-line commands.
 #
 
-# Detection possible: echo $'\n'
+# Equivalent xtrace, detection possible: echo $'\n'
 echo "
 "
 
-# Not equivalent, detection hard: echo -E $'\n\n'
+# Wrong xtrace, detection hard: echo -E $'\n\n'
 echo -E "
 \n"
 
-# Not equivalent, detection hard: echo -E $'\n\n'
-echo -
-E '
+# Wrong xtrace, detection hard: echo -E $'\n\n'
+echo -E '
 \n'
-# Equivalent, detection hard: echo -e $'\n\n'
+
+# Equivalent xtrace, detection hard: echo -e $'\n\n'
 echo -e "
 \n"
 
-# Equivalent, detection hard: echo $'\n\n'
+# Equivalent xtrace, detection hard: echo $'\n\n'
 echo "
 "$'\n'

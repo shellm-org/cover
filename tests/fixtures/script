@@ -2,7 +2,8 @@ echo $(
   # comment
   echo "hello" \
     "world
-    thanks" | # comment
+    adding $(echo "\"stuff") \"just to see
+    how it behaves" | # comment
       cat | ( # comment
         # comment
         cat -n # comment
